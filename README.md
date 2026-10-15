@@ -5,13 +5,15 @@
 Currently the implementation generates a text file that contains every single valid Finnish SSN.
 This includes the new separators for the 20th and 21st centuries, but excludes the temporary individual numbers.
 
-All together there are **426,386,564** SSNs generated. On my PC it takes between **6-8 seconds** to generate them all. The output file size is **5,116,638,768** bytes (~5GB).
+All together there are **426,386,564** SSNs generated.
+On my PC it takes **~2 seconds** to generate them all (Windows version that uses memory mapping).
+The output file size is **5,116,638,768** bytes (~5GB).
 
 The most significant optimizations done so far include:
 
 - The use of lookup tables whenever possible instead of heavier computations
 - Not using fprintf to write SSNs to file
-- Using a reasonable buffer size (8-32MB)
+- Memory mapping
 
 The biggest bottle neck is IO, i.e. writing to file. Over 90% of CPU time is used on IO, so the next steps would be to focus on optimizing that.
 

@@ -1,7 +1,24 @@
-debug:
-	gcc -Og -Wall -Wextra -pedantic -S hetugen.c
-	gcc -Og -Wall -Wextra -pedantic hetugen.c -o hetugen.exe
+CC 				:= gcc
+CFLAGS			:= -Wall -Wextra -Wpedantic
 
-release:
-	gcc -Ofast -march=native -DNODEBUG -Wall -Wextra -pedantic -s -S hetugen.c
-	gcc -Ofast -march=native -DNODEBUG -Wall -Wextra -pedantic -s hetugen.c -o hetugen.exe
+DEBUG_FLAGS		:= -Og -g
+RELEASE_FLAGS 	:= -Ofast -march=native -DNODEBUG -s
+
+BIN_DIR			:= bin
+
+.PHONY: debug release debug-win release-win
+
+debug: bin
+	$(CC) $(CFLAGS) $(DEBUG_FLAGS) hetugen.c -o $(BIN_DIR)/hetugen.debug.exe
+
+release: bin
+	$(CC) $(CFLAGS) $(RELEASE_FLAGS) hetugen.c -o $(BIN_DIR)/hetugen.exe
+
+debug-win: bin
+	$(CC) $(CFLAGS) $(DEBUG_FLAGS) hetugen.win.c -o $(BIN_DIR)/hetugen.win.debug.exe
+
+release-win: bin
+	$(CC) $(CFLAGS) $(RELEASE_FLAGS) hetugen.win.c -o $(BIN_DIR)/hetugen.win.exe
+
+bin:
+	mkdir bin
