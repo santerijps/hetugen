@@ -14,10 +14,20 @@
         4. MONTH
         5. DAY
         6. INDIVIDUAL NUMBER
+
+    Multithreading:
+        Every line is exactly 12 bytes, so the file offset of every
+        (century, separator, year) block is known up front. Each block is a
+        work unit; worker threads claim units from a shared counter and write
+        them directly into their own region of the memory mapped file.
+
+        Usage: hetugen.win.exe [thread_count]
+        (default: all logical processors)
 */
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // index by: (1) is leap year (2) month
 static const char DAYS_IN_MONTH_LOOKUP[2][16] = {
@@ -199,10 +209,154 @@ static const char LEAP_YEAR_LOOKUP[4096] = {
     [2096] = 1, [2104] = 1, [2108] = 1, [2112] = 1,
 };
 
+// Every SSN line is exactly 12 bytes: DDMMYYsNNNH\n
+#define LINE_LENGTH 12
+
+// Individual numbers 002..899
+#define INDIVIDUAL_NUMBERS_PER_DAY (899 - 2 + 1)
+
+// One unit of work = one (century, separator, year) combination.
+// 18xx: 1 separator, 19xx: 6 separators, 20xx: 6 separators -> 13 * 100 = 1300 units.
+#define MAX_WORK_UNITS 2048
+
+// Upper bound for worker threads (can be overridden on the command line).
+#define MAX_THREADS 256
+
 static const unsigned long long FILE_SIZE = 5116638768;
 
-int main(void) {
-    int count = 0;
+typedef struct {
+    unsigned long long offset; // byte offset of the unit's first line in the output file
+    short century;             // 18, 19 or 20
+    short yy;                  // 0..99
+    char separator;
+} WorkUnit;
+
+typedef struct {
+    char *buffer;
+    const WorkUnit *units;
+    LONG unit_count;
+    volatile LONG next_unit;
+} SharedState;
+
+typedef struct {
+    SharedState *shared;
+    unsigned long long count;
+} ThreadContext;
+
+// Writes all SSNs of a single (century, separator, year) unit into its
+// own, non-overlapping region of the memory mapped file.
+static unsigned long long generate_unit(char *buffer, const WorkUnit *unit) {
+    char *bufptr = buffer + unit->offset;
+    const int yy = unit->yy;
+    const char s = unit->separator;
+    const int is_leap_year = LEAP_YEAR_LOOKUP[unit->century * 100 + yy];
+    const char *days_in_month_lookup = DAYS_IN_MONTH_LOOKUP[is_leap_year];
+    unsigned long long count = 0;
+
+    for (int m = 1; m <= 12; m += 1) {
+        const int days_in_month = days_in_month_lookup[m];
+
+        for (int d = 1; d <= days_in_month; d += 1) {
+            for (int n = 2; n <= 899; n += 1) {
+                const char h = HASH_LOOKUP[((d * 10000000) + (m * 100000) + (yy * 1000) + n) % 31];
+
+                *bufptr++ = DAY_STRING_LOOKUP[d][0];
+                *bufptr++ = DAY_STRING_LOOKUP[d][1];
+                *bufptr++ = MONTH_STRING_LOOKUP[m][0];
+                *bufptr++ = MONTH_STRING_LOOKUP[m][1];
+                *bufptr++ = YEAR_STRING_LOOKUP[yy][0];
+                *bufptr++ = YEAR_STRING_LOOKUP[yy][1];
+                *bufptr++ = s;
+                *bufptr++ = NNN_STRING_LOOKUP[n][0];
+                *bufptr++ = NNN_STRING_LOOKUP[n][1];
+                *bufptr++ = NNN_STRING_LOOKUP[n][2];
+                *bufptr++ = h;
+                *bufptr++ = '\n';
+
+                count += 1;
+            }
+        }
+    }
+
+    return count;
+}
+
+// Workers pull units from a shared counter until none are left. Units are
+// small (~4 MB each) so this balances load well, and threads stay close to
+// each other in the file which keeps the OS write-back roughly sequential.
+static DWORD WINAPI worker(LPVOID param) {
+    ThreadContext *ctx = (ThreadContext*) param;
+    SharedState *shared = ctx->shared;
+
+    for (;;) {
+        const LONG i = InterlockedIncrement(&shared->next_unit) - 1;
+        if (i >= shared->unit_count) {
+            break;
+        }
+        ctx->count += generate_unit(shared->buffer, &shared->units[i]);
+    }
+
+    return 0;
+}
+
+// Fills the work unit table in the same order as the original nested loops
+// (century -> separator -> year), so the output file is byte-for-byte identical.
+// Returns the total output size in bytes.
+static unsigned long long build_work_units(WorkUnit *units, LONG *unit_count) {
+    unsigned long long offset = 0;
+    LONG count = 0;
+
+    for (int c = 18; c <= 20; c += 1) {
+        for (const char *separators = SEPARATORS_LOOKUP[c]; *separators; separators += 1) {
+            for (int yy = 0; yy <= 99; yy += 1) {
+                const int days_in_year = 365 + LEAP_YEAR_LOOKUP[c * 100 + yy];
+
+                units[count].offset = offset;
+                units[count].century = (short) c;
+                units[count].yy = (short) yy;
+                units[count].separator = *separators;
+                count += 1;
+
+                offset += (unsigned long long) days_in_year * INDIVIDUAL_NUMBERS_PER_DAY * LINE_LENGTH;
+            }
+        }
+    }
+
+    *unit_count = count;
+    return offset;
+}
+
+static int default_thread_count(void) {
+    DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (n == 0) {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        n = info.dwNumberOfProcessors;
+    }
+    return n > 0 ? (int) n : 1;
+}
+
+int main(int argc, char **argv) {
+    static WorkUnit units[MAX_WORK_UNITS];
+    static HANDLE threads[MAX_THREADS];
+    static ThreadContext contexts[MAX_THREADS];
+
+    // Optional first argument: number of worker threads (default: all logical processors).
+    int thread_count = argc > 1 ? atoi(argv[1]) : default_thread_count();
+    if (thread_count < 1) thread_count = 1;
+    if (thread_count > MAX_THREADS) thread_count = MAX_THREADS;
+
+    LONG unit_count = 0;
+    const unsigned long long total_size = build_work_units(units, &unit_count);
+
+    if (total_size != FILE_SIZE) {
+        fprintf(stderr, "Unexpected output size %llu (expected %llu)\n", total_size, FILE_SIZE);
+        return 1;
+    }
+
+    LARGE_INTEGER freq, t_start, t_generated, t_end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t_start);
 
     HANDLE file_handle = CreateFileA(
         "out.txt",
@@ -249,55 +403,54 @@ int main(void) {
         return 1;
     }
 
-    char *bufptr = buffer;
+    SharedState shared = {
+        .buffer = buffer,
+        .units = units,
+        .unit_count = unit_count,
+        .next_unit = 0,
+    };
 
-    for (int c = 18; c <= 20; c += 1) {
-        char *separators = (char*) SEPARATORS_LOOKUP[c];
-        const int c_start = c * 100;
-        const int c_stop = c_start + 99;
-
-        for (; *separators; separators += 1) {
-            const char s = *separators;
-
-            for (int y = c_start; y <= c_stop; y += 1) {
-                const int is_leap_year = LEAP_YEAR_LOOKUP[y];
-                const char *days_in_month_lookup = DAYS_IN_MONTH_LOOKUP[is_leap_year];
-                const int yy = y - c_start; // 1965 - 1900 = 65
-
-                for (int m = 1; m <= 12; m += 1) {
-                    const int days_in_month = days_in_month_lookup[m];
-
-                    for (int d = 1; d <= days_in_month; d += 1) {
-                        for (int n = 2; n <= 899; n += 1) {
-                            const char h = HASH_LOOKUP[((d * 10000000) + (m * 100000) + (yy * 1000) + n) % 31];
-
-                            *bufptr++ = DAY_STRING_LOOKUP[d][0];
-                            *bufptr++ = DAY_STRING_LOOKUP[d][1];
-                            *bufptr++ = MONTH_STRING_LOOKUP[m][0];
-                            *bufptr++ = MONTH_STRING_LOOKUP[m][1];
-                            *bufptr++ = YEAR_STRING_LOOKUP[yy][0];
-                            *bufptr++ = YEAR_STRING_LOOKUP[yy][1];
-                            *bufptr++ = s;
-                            *bufptr++ = NNN_STRING_LOOKUP[n][0];
-                            *bufptr++ = NNN_STRING_LOOKUP[n][1];
-                            *bufptr++ = NNN_STRING_LOOKUP[n][2];
-                            *bufptr++ = h;
-                            *bufptr++ = '\n';
-
-                            count += 1;
-                        }
-                    }
-                }
-            }
+    int started = 0;
+    for (int i = 0; i < thread_count; i += 1) {
+        contexts[i].shared = &shared;
+        contexts[i].count = 0;
+        threads[i] = CreateThread(NULL, 0, worker, &contexts[i], 0, NULL);
+        if (threads[i] == NULL) {
+            fprintf(stderr, "CreateThread failed. Error: %lu\n", GetLastError());
+            break;
         }
+        started += 1;
     }
 
-    fprintf(stderr, "Generated %d SSNs!\n", count);
+    // If no thread could be started, do the work on the main thread.
+    unsigned long long count = 0;
+    if (started == 0) {
+        contexts[0].shared = &shared;
+        contexts[0].count = 0;
+        worker(&contexts[0]);
+        count = contexts[0].count;
+    }
+
+    for (int i = 0; i < started; i += 1) {
+        WaitForSingleObject(threads[i], INFINITE);
+        CloseHandle(threads[i]);
+        count += contexts[i].count;
+    }
+
+    QueryPerformanceCounter(&t_generated);
 
     // FlushViewOfFile(buffer, FILE_SIZE);
     UnmapViewOfFile(buffer);
     CloseHandle(file_mapping_handle);
     CloseHandle(file_handle);
+
+    QueryPerformanceCounter(&t_end);
+
+    fprintf(stderr, "Generated %llu SSNs using %d thread(s)!\n", count, started > 0 ? started : 1);
+    fprintf(stderr, "Generate: %.3f s, unmap/close: %.3f s, total: %.3f s\n",
+        (double)(t_generated.QuadPart - t_start.QuadPart) / freq.QuadPart,
+        (double)(t_end.QuadPart - t_generated.QuadPart) / freq.QuadPart,
+        (double)(t_end.QuadPart - t_start.QuadPart) / freq.QuadPart);
 
     return 0;
 }
